@@ -1,0 +1,507 @@
+"""
+TANGO — Rosenbrock Ablation Benchmark
+======================================
+Three-way comparison on Rosenbrock at D ∈ {10, 20, 50}:
+
+  (A) Tango-Full   — cyclic LR explore phase + ef decay + cosine exploit
+  (B) Tango-NoEF   — cosine LR only, ef pinned to 1.0 (matches paper config)
+  (C) Adam-Best    — AdamW grid search over 5 LRs, best result reported
+
+Purpose: ablate the contribution of the exploration factor (φ(t)) and
+cyclic LR phase independently from the tangent momentum mechanism.
+
+Key differences from ultra_benchmark.py:
+  - Noise injection fully removed (NOISE_START was effectively disabling it;
+    we remove it explicitly for clarity)
+  - Trust-region accept/reject on each tangent step (Eq. 12-15 of paper)
+  - Tango-Full uses cyclic LR for steps < explore_end, then cosine decay
+  - Tango-NoEF uses cosine decay throughout; ef = 1.0 throughout
+  - Both variants log ef, sharpness, tang_exec, tang_block, trust_accept per seed
+"""
+
+import torch
+import numpy as np
+import math
+import time
+import json
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REPRODUCIBILITY
+# ─────────────────────────────────────────────────────────────────────────────
+GLOBAL_SEED = 0
+torch.manual_seed(GLOBAL_SEED)
+np.random.seed(GLOBAL_SEED)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BENCHMARK FUNCTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def rosenbrock(x: torch.Tensor) -> torch.Tensor:
+    """
+    f(x) = Σ [100·(x_{i+1} − x_i²)² + (1 − x_i)²]
+    Global minimum: f(1,...,1) = 0.
+    Condition number ≈ 10^7 — canonical stress test for trajectory quality.
+    """
+    return torch.sum(100.0 * (x[1:] - x[:-1] ** 2) ** 2 + (1.0 - x[:-1]) ** 2)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RUN CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+TOTAL_STEPS   = 20_000
+N_SEEDS       = 5
+DIMS          = [10, 20, 50]
+LOG_EVERY     = 1_000
+ADAM_LR_GRID  = [1e-2, 3e-3, 1e-3, 3e-4, 1e-4]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TANGO HYPERPARAMETERS
+# ─────────────────────────────────────────────────────────────────────────────
+# Learning rate schedule
+LR_MAX            = 0.005          # cyclic peak (Tango-Full explore phase)
+LR_MIN            = 1e-6           # cyclic trough
+T_CYCLE           = 800            # cycle length in steps
+EXPLORE_FRAC      = 0.80           # fraction of steps in explore phase
+LR_EXPLOIT_START  = 0.005          # cosine start for exploit phase
+LR_EXPLOIT_END    = 5e-4           # cosine end for exploit phase
+LR_COSINE_START   = 0.003          # Tango-NoEF cosine start (full run)
+LR_COSINE_END     = 3e-5           # Tango-NoEF cosine end (full run)
+
+# Exploration factor (φ)
+EF_DECAY_START    = 0.60           # fraction of steps before φ starts decaying
+EF_FLOOR          = 0.03           # φ₀ — minimum exploration factor
+
+# Curvature probe
+SHARP_INTERVAL    = 200            # steps between FD curvature updates
+FD_EPS            = 1e-4           # finite-difference step size
+
+# Tangent momentum
+TANG_BETA         = 0.80           # momentum coefficient for tangent buffer
+TANG_EPS_BASE     = 4e-4           # ε₀ — base tangent step size
+TANG_SIGMA        = 50.0           # normalisation constant σ (Eq. 9)
+TANG_INTERVAL     = 100            # steps between tangent step attempts
+TANG_WARMUP       = 500            # steps before first tangent attempt
+
+# Trust-region constants (Eq. 15)
+TR_DELTA_INIT     = 1e-3           # initial trust radius Δ₀
+TR_DELTA_MIN      = 1e-6           # hard floor Δ_min
+TR_DELTA_MAX      = 1.0            # hard ceiling Δ_max
+TR_ETA0           = 0.10           # rejection threshold ρ < η₀ → contract
+TR_ETA1           = 0.75           # expansion threshold ρ ≥ η₁ → expand
+TR_GAMMA_PLUS     = 2.0            # expand factor γ⁺
+TR_GAMMA_MINUS    = 0.50           # contract factor γ⁻
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCHEDULE HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cyclic_lr(step: int, T: int, lr_max: float, lr_min: float) -> float:
+    """Inverted cosine cycle — Equation 3 of paper."""
+    t = step % T
+    return lr_min + 0.5 * (lr_max - lr_min) * (1.0 + math.cos(math.pi * t / T))
+
+
+def cosine_lr(step: int, total: int, lr_start: float, lr_end: float) -> float:
+    """Standard cosine decay — Equation 5 of paper."""
+    p = min(step / max(total, 1), 1.0)
+    return lr_end + 0.5 * (lr_start - lr_end) * (1.0 + math.cos(math.pi * p))
+
+
+def exploration_factor(step: int, total: int,
+                       decay_start_frac: float, floor: float) -> float:
+    """
+    φ(t) — Equation 4 of paper.
+    Returns 1.0 before decay_start_frac·T, then linearly decays to floor.
+    """
+    decay_start = int(total * decay_start_frac)
+    if step < decay_start:
+        return 1.0
+    dp = (step - decay_start) / max(total - decay_start, 1)
+    return max(floor, 1.0 - dp)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CURVATURE PROBE — Equation 6
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fd_curvature(fn, x: torch.Tensor, g_np: np.ndarray,
+                 eps: float = FD_EPS) -> float:
+    """
+    Second directional derivative of ℒ along the unit gradient ġ.
+    Cost: 1 extra forward pass, zero autograd graph retained.
+    Returns κ(θ) ≈ ġᵀHġ — an upper bound on λ_max(H) by the Rayleigh quotient.
+    """
+    norm_g = np.linalg.norm(g_np)
+    if norm_g < 1e-12:
+        return 0.0
+    g_hat  = g_np / norm_g
+    x_plus = x.detach() + torch.tensor(g_hat * eps, dtype=torch.float64)
+    with torch.no_grad():
+        f0    = fn(x.detach()).item()
+        f_eps = fn(x_plus).item()
+    return (f_eps - f0 - eps * norm_g) / (0.5 * eps ** 2 + 1e-30)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TANGENT MOMENTUM BUFFER — Equations 7–8
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TangentMomentum:
+    def __init__(self, dim: int, beta: float = TANG_BETA):
+        self.beta = beta
+        self.v    = np.zeros(dim, dtype=np.float64)
+
+    def get_direction(self, g_np: np.ndarray) -> np.ndarray:
+        """
+        Project random noise onto the tangent plane (orthogonal to ġ),
+        update momentum buffer, return normalised direction dₜ.
+        """
+        g_hat = g_np / (np.linalg.norm(g_np) + 1e-8)
+        noise = np.random.randn(len(g_np)).astype(np.float64)
+        noise -= np.dot(noise, g_hat) * g_hat          # Eq. 7: project
+        noise /= np.linalg.norm(noise) + 1e-8
+        self.v = self.beta * self.v + (1.0 - self.beta) * noise  # Eq. 8
+        return self.v / (np.linalg.norm(self.v) + 1e-8)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CORE TANGO RUNNER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_tango(fn, x0: torch.Tensor, total_steps: int,
+              use_cyclic_lr: bool = True,
+              use_ef_decay:  bool = True,
+              label: str = "Tango-Full") -> dict:
+    """
+    Run Tango on fn starting from x0.
+
+    Args:
+        use_cyclic_lr : if True, uses cyclic LR for the explore phase
+                        (Tango-Full); if False, uses cosine decay throughout
+                        (Tango-NoEF baseline matching paper config).
+        use_ef_decay  : if True, φ(t) decays after EF_DECAY_START·T;
+                        if False, φ(t) = 1.0 throughout.
+    """
+    dim  = x0.shape[0]
+    x    = x0.clone().double().requires_grad_(True)
+    opt  = torch.optim.AdamW([x], lr=LR_MAX if use_cyclic_lr else LR_COSINE_START,
+                              betas=(0.9, 0.999), weight_decay=0.0)
+    tang = TangentMomentum(dim)
+
+    best_loss  = float("inf")
+    best_x     = x.data.clone()
+    sharpness  = 0.0
+    tr_delta   = TR_DELTA_INIT
+    explore_end = int(total_steps * EXPLORE_FRAC)
+
+    tang_exec      = 0
+    tang_block_sharp = 0
+    tang_block_loss  = 0
+    trust_accept   = 0
+    trust_reject   = 0
+    history        = []
+
+    for step in range(total_steps):
+
+        # ── Learning rate ────────────────────────────────────────────────────
+        if use_cyclic_lr:
+            if step < explore_end:
+                lr = cyclic_lr(step, T_CYCLE, LR_MAX, LR_MIN)
+            else:
+                lr = cosine_lr(step - explore_end, total_steps - explore_end,
+                               LR_EXPLOIT_START, LR_EXPLOIT_END)
+        else:
+            lr = cosine_lr(step, total_steps, LR_COSINE_START, LR_COSINE_END)
+
+        for pg in opt.param_groups:
+            pg["lr"] = lr
+
+        # ── Exploration factor φ(t) — Equation 4 ────────────────────────────
+        ef = (exploration_factor(step, total_steps, EF_DECAY_START, EF_FLOOR)
+              if use_ef_decay else 1.0)
+
+        # ── Gradient step (AdamW base) ───────────────────────────────────────
+        opt.zero_grad()
+        loss = fn(x)
+        loss.backward()
+        g_np = x.grad.detach().cpu().numpy().copy()
+        opt.step()
+
+        loss_val = loss.item()
+        if loss_val < best_loss:
+            best_loss = loss_val
+            best_x    = x.data.clone()
+
+        # ── Sharpness probe — Equation 6 ─────────────────────────────────────
+        if step % SHARP_INTERVAL == 0 and step > 0:
+            sharpness = fd_curvature(fn, x, g_np)
+
+        # ── Tangent step with trust region — Equations 9–10, 12–15 ──────────
+        if step % TANG_INTERVAL == 0 and step > TANG_WARMUP:
+
+            # Gate 1: loss gate (not already at best known point)
+            loss_gate = loss_val > best_loss * 1.0   # always true unless exact tie
+
+            # Gate 2: sharpness gate — dynamic ceiling κ_max
+            dyn_kmax   = 0.8 * (2.0 / max(lr, 1e-8))
+            sharp_gate = sharpness < dyn_kmax
+
+            if not loss_gate:
+                tang_block_loss += 1
+            elif not sharp_gate:
+                tang_block_sharp += 1
+            else:
+                # Compute proposed tangent step magnitude — Equation 9
+                sharp_safe = max(abs(sharpness), 1.0)
+                eps_t      = TANG_EPS_BASE * math.sqrt(TANG_SIGMA / sharp_safe) * ef
+                eps_t      = float(np.clip(eps_t, 1e-6, TR_DELTA_MAX))
+
+                # Cap to trust radius (Equation 12: ‖δₜ‖ ≤ Δₜ)
+                eps_t = min(eps_t, tr_delta)
+
+                direction = tang.get_direction(g_np)
+                delta     = torch.tensor(direction * eps_t, dtype=torch.float64)
+
+                # Trust-region evaluation: ρₜ = (ℓₜ − ℓₜ⁺) / (½·κ·‖δₜ‖²)
+                # Gradient term gᵀδ = 0 by construction of tangent plane
+                with torch.no_grad():
+                    f_before = fn(x.detach()).item()
+                    f_after  = fn(x.detach() + delta).item()
+
+                reduction_actual    = f_before - f_after
+                # Predicted reduction: mₜ(δₜ) = ℓₜ − ½·κ·‖δₜ‖² (Eq. 14)
+                # Note: gᵀδ = 0 so the linear term vanishes
+                predicted_reduction = 0.5 * abs(sharpness) * eps_t ** 2
+
+                if predicted_reduction < 1e-30:
+                    rho = 1.0 if reduction_actual >= 0 else -1.0
+                else:
+                    rho = reduction_actual / predicted_reduction
+
+                # Accept / reject and update trust radius — Equation 15
+                if rho >= TR_ETA0:
+                    # Accept step
+                    x.data.add_(delta)
+                    trust_accept += 1
+                    tang_exec    += 1
+                    if rho >= TR_ETA1:
+                        tr_delta = min(TR_GAMMA_PLUS * tr_delta, TR_DELTA_MAX)
+                    # else: keep Δ unchanged
+                else:
+                    # Reject step — do NOT update x
+                    tr_delta = max(TR_GAMMA_MINUS * tr_delta, TR_DELTA_MIN)
+                    trust_reject += 1
+
+                # Update best checkpoint after accepted tangent step
+                with torch.no_grad():
+                    tang_loss = fn(x.detach()).item()
+                if tang_loss < best_loss:
+                    best_loss = tang_loss
+                    best_x    = x.data.clone()
+
+        # ── Logging ──────────────────────────────────────────────────────────
+        if step % LOG_EVERY == 0:
+            history.append({
+                "step":      step,
+                "loss":      float(loss_val),
+                "best_loss": float(best_loss),
+                "lr":        float(lr),
+                "ef":        float(ef),
+                "sharpness": float(sharpness),
+                "tr_delta":  float(tr_delta),
+            })
+
+    # ── Restore best checkpoint ───────────────────────────────────────────────
+    x.data.copy_(best_x)
+    with torch.no_grad():
+        final_loss = fn(x.detach()).item()
+
+    dist_to_optimum = float(torch.norm(x.detach() -
+                            torch.ones(dim, dtype=torch.float64)).item())
+
+    return {
+        "label":            label,
+        "final_loss":       float(final_loss),
+        "best_loss":        float(best_loss),
+        "dist_to_optimum":  dist_to_optimum,
+        "tang_exec":        tang_exec,
+        "tang_block_sharp": tang_block_sharp,
+        "tang_block_loss":  tang_block_loss,
+        "trust_accept":     trust_accept,
+        "trust_reject":     trust_reject,
+        "history":          history,
+        "x_final":          x.data.tolist(),
+    }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADAM BASELINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_adam(fn, x0: torch.Tensor, total_steps: int, lr: float) -> dict:
+    x   = x0.clone().double().requires_grad_(True)
+    opt = torch.optim.AdamW([x], lr=lr, betas=(0.9, 0.999), weight_decay=0.0)
+    for _ in range(total_steps):
+        opt.zero_grad()
+        loss = fn(x)
+        loss.backward()
+        opt.step()
+    with torch.no_grad():
+        final_loss = fn(x.detach()).item()
+    dist = float(torch.norm(x.detach() -
+                            torch.ones(x.shape[0], dtype=torch.float64)).item())
+    return {
+        "label":           f"Adam-lr{lr:.0e}",
+        "lr":              lr,
+        "final_loss":      float(final_loss),
+        "dist_to_optimum": dist,
+        "x_final":         x.data.tolist(),
+    }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+HEADER = "=" * 76
+
+def fmt(val):
+    return f"{val:.4e}"
+
+def winner_tag(a, b, c):
+    """Return label of best (lowest) among three values."""
+    best = min(a, b, c)
+    if best == a:   return "Tango-Full"
+    elif best == b: return "Tango-NoEF"
+    else:           return "Adam-Best"
+
+print(HEADER)
+print("  TANGO ROSENBROCK ABLATION")
+print(f"  {TOTAL_STEPS:,} steps  |  {N_SEEDS} seeds  |  D ∈ {DIMS}")
+print(f"  Variants: Tango-Full (cyclic+ef) | Tango-NoEF (cosine, ef=1) | Adam-Best")
+print(HEADER)
+
+all_results = {}
+
+for dim in DIMS:
+    print(f"\n{'─'*76}")
+    print(f"  D = {dim}")
+    print(f"{'─'*76}")
+    print(f"  {'seed':>4}  {'Tango-Full':>14}  {'Tango-NoEF':>14}  {'Adam-Best':>14}  {'Winner':<12}  {'ef_min':>7}  time")
+
+    seed_rows = []
+
+    for seed in range(N_SEEDS):
+        rng = np.random.default_rng(seed * 137 + dim * 31)
+        x0  = torch.tensor(rng.uniform(-2.0, -0.5, dim), dtype=torch.float64)
+        t0  = time.time()
+
+        # (A) Tango-Full: cyclic LR + ef decay
+        r_full = run_tango(fn=rosenbrock, x0=x0, total_steps=TOTAL_STEPS,
+                           use_cyclic_lr=True, use_ef_decay=True,
+                           label="Tango-Full")
+
+        # (B) Tango-NoEF: cosine LR only, ef=1.0 throughout (paper config)
+        r_noef = run_tango(fn=rosenbrock, x0=x0, total_steps=TOTAL_STEPS,
+                           use_cyclic_lr=False, use_ef_decay=False,
+                           label="Tango-NoEF")
+
+        # (C) Adam-Best: grid search, best result
+        best_adam = None
+        for adam_lr in ADAM_LR_GRID:
+            ar = run_adam(rosenbrock, x0, TOTAL_STEPS, adam_lr)
+            if best_adam is None or ar["final_loss"] < best_adam["final_loss"]:
+                best_adam = ar
+
+        elapsed = time.time() - t0
+
+        # ef at final step for Tango-Full
+        ef_min = exploration_factor(TOTAL_STEPS - 1, TOTAL_STEPS,
+                                    EF_DECAY_START, EF_FLOOR)
+
+        w = winner_tag(r_full["final_loss"],
+                       r_noef["final_loss"],
+                       best_adam["final_loss"])
+
+        print(f"  {seed:>4}  "
+              f"{fmt(r_full['final_loss']):>14}  "
+              f"{fmt(r_noef['final_loss']):>14}  "
+              f"{fmt(best_adam['final_loss']):>14}  "
+              f"{w:<12}  "
+              f"{ef_min:>7.3f}  "
+              f"{elapsed:.1f}s")
+
+        seed_rows.append({
+            "seed":     seed,
+            "full":     r_full,
+            "noef":     r_noef,
+            "adam":     best_adam,
+        })
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    full_vals  = np.array([r["full"]["final_loss"]  for r in seed_rows])
+    noef_vals  = np.array([r["noef"]["final_loss"]  for r in seed_rows])
+    adam_vals  = np.array([r["adam"]["final_loss"]  for r in seed_rows])
+
+    full_wins  = int(np.sum(full_vals  < np.minimum(noef_vals, adam_vals)))
+    noef_wins  = int(np.sum(noef_vals  < np.minimum(full_vals, adam_vals)))
+    adam_wins  = int(np.sum(adam_vals  < np.minimum(full_vals, noef_vals)))
+
+    print(f"\n  SUMMARY  D={dim}")
+    print(f"  {'':20}  {'mean':>14}  {'std':>12}  {'wins':>6}")
+    print(f"  {'Tango-Full':20}  {np.mean(full_vals):>14.4e}  "
+          f"{np.std(full_vals):>12.2e}  {full_wins:>6}/{N_SEEDS}")
+    print(f"  {'Tango-NoEF (paper)':20}  {np.mean(noef_vals):>14.4e}  "
+          f"{np.std(noef_vals):>12.2e}  {noef_wins:>6}/{N_SEEDS}")
+    print(f"  {'Adam-Best':20}  {np.mean(adam_vals):>14.4e}  "
+          f"{np.std(adam_vals):>12.2e}  {adam_wins:>6}/{N_SEEDS}")
+
+    # Tango-Full vs Tango-NoEF ratio
+    mean_full = float(np.mean(full_vals))
+    mean_noef = float(np.mean(noef_vals))
+    if mean_full > 1e-300 and mean_noef > 1e-300:
+        ratio_ef = mean_noef / mean_full
+        oom_ef   = math.log10(mean_noef) - math.log10(mean_full)
+        print(f"\n  ef-decay impact (Full vs NoEF):  ratio={ratio_ef:.2f}×  OoM={oom_ef:+.2f}")
+    elif mean_full <= 1e-300:
+        print(f"\n  ef-decay impact: Tango-Full reached numerical zero (NoEF={mean_noef:.4e})")
+
+    all_results[f"D{dim}"] = {
+        "seeds":      seed_rows,
+        "mean_full":  float(np.mean(full_vals)),
+        "mean_noef":  float(np.mean(noef_vals)),
+        "mean_adam":  float(np.mean(adam_vals)),
+        "std_full":   float(np.std(full_vals)),
+        "std_noef":   float(np.std(noef_vals)),
+        "std_adam":   float(np.std(adam_vals)),
+        "wins_full":  full_wins,
+        "wins_noef":  noef_wins,
+        "wins_adam":  adam_wins,
+    }
+
+print(f"\n{HEADER}")
+print("  ABLATION SUMMARY — ef decay contribution")
+print(f"  {'D':>4}  {'Tango-Full mean':>18}  {'Tango-NoEF mean':>18}  "
+      f"{'Adam-Best mean':>18}  {'ef OoM':>8}")
+print(f"{'─'*76}")
+for dim in DIMS:
+    r   = all_results[f"D{dim}"]
+    mf  = r["mean_full"]
+    mn  = r["mean_noef"]
+    ma  = r["mean_adam"]
+    if mf > 1e-300 and mn > 1e-300:
+        oom = math.log10(mn) - math.log10(mf)
+        oom_str = f"{oom:+.2f}"
+    elif mf <= 1e-300:
+        oom_str = "→ 0"
+    else:
+        oom_str = "n/a"
+    print(f"  {dim:>4}  {mf:>18.4e}  {mn:>18.4e}  {ma:>18.4e}  {oom_str:>8}")
+print(HEADER)
+
+with open("rosenbrock_ablation_results.json", "w") as f:
+    # x_final lists can be large; strip them for the summary JSON
+    slim = {}
+    for k, v in all_results.items():
+        slim[k] = {kk: vv for kk, vv in v.items() if kk != "seeds"}
+    json.dump(slim, f, indent=2)
+
+print("\nSaved → rosenbrock_ablation_results.json")
+print("\nInterpretation guide:")
+print("  Tango-Full vs Tango-NoEF  →  isolates ef-decay + cyclic LR contribution")
+print("  Tango-NoEF vs Adam-Best   →  isolates tangent momentum contribution alone")
+print("  Tango-Full vs Adam-Best   →  overall Tango advantage (full config)")
